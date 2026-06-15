@@ -274,6 +274,11 @@ func newTenantAccount(
 		Models: schemas.WhiteList{"*"},
 		Weight: 1.0,
 	}
+	if providerKey == schemas.VLLM {
+		key.VLLMKeyConfig = &schemas.VLLMKeyConfig{
+			URL: schemas.EnvVar{Val: vllmServerURL(baseURL)},
+		}
+	}
 
 	// Bedrock posture → Bifrost BedrockKeyConfig. Auth modes:
 	//   - "api_key":         key.Value carries the API key (already set).
@@ -365,6 +370,14 @@ func newTenantAccount(
 		keys:     []schemas.Key{key},
 		config:   &schemas.ProviderConfig{NetworkConfig: nc},
 	}
+}
+
+func vllmServerURL(baseURL string) string {
+	trimmed := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(trimmed, "/v1") {
+		return strings.TrimSuffix(trimmed, "/v1")
+	}
+	return trimmed
 }
 
 // subBlockID returns a stable hash of the per-provider sub-block so two
@@ -514,7 +527,7 @@ func mapProviderKey(provider string) (schemas.ModelProvider, error) {
 	case "replicate":
 		return schemas.Replicate, nil
 	case "vllm":
-		return schemas.ModelProvider("vllm"), nil
+		return schemas.VLLM, nil
 	default:
 		return "", fmt.Errorf("gateway: unknown provider %q", provider)
 	}
@@ -527,7 +540,7 @@ func (bp *bifrostProvider) ChatCompletion(ctx context.Context, req *ChatRequest)
 	}
 
 	bReq := toBifrostChatRequest(bp.providerKey, bp.model, req)
-	bCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+	bCtx := newBifrostRequestContext(ctx, req)
 	resp, bErr := client.ChatCompletionRequest(bCtx, bReq)
 	if bErr != nil {
 		return nil, bifrostErrorToGo(bErr)
@@ -543,7 +556,7 @@ func (bp *bifrostProvider) ChatCompletionStream(ctx context.Context, req *ChatRe
 	}
 
 	bReq := toBifrostChatRequest(bp.providerKey, bp.model, req)
-	bCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+	bCtx := newBifrostRequestContext(ctx, req)
 	stream, bErr := client.ChatCompletionStreamRequest(bCtx, bReq)
 	if bErr != nil {
 		return nil, bifrostErrorToGo(bErr)
@@ -568,6 +581,14 @@ func (bp *bifrostProvider) ChatCompletionStream(ctx context.Context, req *ChatRe
 }
 
 // ---------- Type conversion helpers ----------
+
+func newBifrostRequestContext(ctx context.Context, req *ChatRequest) *schemas.BifrostContext {
+	bCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+	if req != nil && len(req.ExtraParams) > 0 {
+		bCtx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
+	}
+	return bCtx
+}
 
 func toBifrostChatRequest(provider schemas.ModelProvider, model string, req *ChatRequest) *schemas.BifrostChatRequest {
 	bReq := &schemas.BifrostChatRequest{
@@ -608,6 +629,9 @@ func toBifrostChatRequest(provider schemas.ModelProvider, model string, req *Cha
 		if err := json.Unmarshal(req.ToolChoice, &tc); err == nil {
 			bReq.Params.ToolChoice = &tc
 		}
+	}
+	if len(req.ExtraParams) > 0 {
+		bReq.Params.ExtraParams = req.ExtraParams
 	}
 
 	if len(req.Fallbacks) > 0 {
