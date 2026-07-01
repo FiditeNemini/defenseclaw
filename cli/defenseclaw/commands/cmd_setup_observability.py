@@ -32,19 +32,17 @@ test <name>           Probe the configured endpoint and report status
 migrate-splunk        Move legacy ``splunk:`` block to ``audit_sinks[]``
 migrate-otel          Convert flat ``otel:`` transport into a named route
 
-All destructive subcommands write atomically (``config.yaml.tmp`` ->
-``rename``) so a crash mid-write cannot leave the gateway with an
-unparseable config.
+All destructive subcommands write through the shared secure atomic
+config writer so a crash mid-write cannot leave the gateway with an
+unparseable config and managed-mode writes remain administrator-gated.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json as _json
 import os
 import socket
 import ssl
-import tempfile
 import urllib.error
 import urllib.request
 from typing import Any
@@ -55,7 +53,7 @@ import click
 from defenseclaw import ux
 from defenseclaw.audit_actions import ACTION_SETUP_OBSERVABILITY
 from defenseclaw.commands.redaction_status import print_redaction_status_hint
-from defenseclaw.config import locked_config_yaml, write_config_yaml_secure
+from defenseclaw.config import config_path_for_data_dir, locked_config_yaml, write_config_yaml_secure
 from defenseclaw.context import AppContext, pass_ctx
 from defenseclaw.observability import (
     PRESETS,
@@ -77,9 +75,6 @@ from defenseclaw.observability.writer import _NAME_RE as _SINK_NAME_RE
 # drifts from the global ``apply_preset`` path. They are imported (not
 # re-implemented) because the writer module is outside this lane's edit
 # surface; the per-connector routing target is the only difference.
-from defenseclaw.observability.writer import (
-    CONFIG_FILE_NAME as _OBS_CONFIG_FILE_NAME,
-)
 from defenseclaw.observability.writer import (
     _apply_secret,
     _build_sink_entry,
@@ -476,7 +471,7 @@ def migrate_splunk_cmd(app: AppContext, do_apply: bool) -> None:
     """
     import yaml
 
-    cfg_path = os.path.join(app.cfg.data_dir, "config.yaml")
+    cfg_path = str(config_path_for_data_dir(app.cfg.data_dir))
     try:
         with open(cfg_path) as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
@@ -539,7 +534,7 @@ def migrate_splunk_cmd(app: AppContext, do_apply: bool) -> None:
             click.echo(f"  audit_sinks already contains {s.get('name')!r} with same endpoint; skipping")
             if do_apply:
                 raw.pop("splunk", None)
-                _write_atomically(cfg_path, raw)
+                write_config_yaml_secure(cfg_path, raw)
                 click.echo("  Removed legacy splunk: block.")
             return
 
@@ -557,7 +552,7 @@ def migrate_splunk_cmd(app: AppContext, do_apply: bool) -> None:
     sinks.append(new_entry)
     raw["audit_sinks"] = sinks
     raw.pop("splunk", None)
-    _write_atomically(cfg_path, raw)
+    write_config_yaml_secure(cfg_path, raw)
     click.echo(f"  Migrated splunk: block to audit_sinks[{name}].")
     if app.logger:
         app.logger.log_action(
@@ -643,7 +638,7 @@ def _test_otel(data_dir: str, name: str, *, timeout: float) -> None:
     """
     import yaml
 
-    cfg_path = os.path.join(data_dir, "config.yaml")
+    cfg_path = str(config_path_for_data_dir(data_dir))
     try:
         with open(cfg_path) as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
@@ -710,7 +705,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def probe_splunk_hec(data_dir: str, name: str, *, timeout: float = 10.0) -> tuple[bool, str]:
     import yaml
 
-    cfg_path = os.path.join(data_dir, "config.yaml")
+    cfg_path = str(config_path_for_data_dir(data_dir))
     with open(cfg_path) as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
     sink = next(
@@ -777,7 +772,7 @@ def probe_splunk_hec(data_dir: str, name: str, *, timeout: float = 10.0) -> tupl
 def _test_otlp_logs(data_dir: str, name: str, *, timeout: float) -> None:
     import yaml
 
-    cfg_path = os.path.join(data_dir, "config.yaml")
+    cfg_path = str(config_path_for_data_dir(data_dir))
     with open(cfg_path) as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
     sink = next(
@@ -798,7 +793,7 @@ def _test_otlp_logs(data_dir: str, name: str, *, timeout: float) -> None:
 def _test_http_jsonl(data_dir: str, name: str, *, timeout: float) -> None:
     import yaml
 
-    cfg_path = os.path.join(data_dir, "config.yaml")
+    cfg_path = str(config_path_for_data_dir(data_dir))
     with open(cfg_path) as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
     sink = next(
@@ -1083,7 +1078,7 @@ def _apply_sink_to_connector(
     dotenv_changes = _apply_secret(data_dir, preset, secret_value, dry_run=dry_run)
 
     if not dry_run:
-        cfg_path = os.path.join(data_dir, _OBS_CONFIG_FILE_NAME)
+        cfg_path = str(config_path_for_data_dir(data_dir))
         with locked_config_yaml(cfg_path):
             raw = _obs_load_raw(cfg_path)
             sinks = _connector_audit_sinks_list(raw, connector, create=True)
@@ -1120,7 +1115,7 @@ def _apply_sink_to_connector(
 
 def _connector_destinations(data_dir: str, connector: str) -> list[Destination] | None:
     """Return a connector's per-connector audit sinks, or None if unset."""
-    raw = _obs_load_raw(os.path.join(data_dir, _OBS_CONFIG_FILE_NAME))
+    raw = _obs_load_raw(str(config_path_for_data_dir(data_dir)))
     sinks = _connector_audit_sinks_list(raw, connector, create=False)
     if sinks is None:
         return None
@@ -1149,7 +1144,7 @@ def _connector_destinations(data_dir: str, connector: str) -> list[Destination] 
 def _set_connector_sink_enabled(
     data_dir: str, connector: str, name: str, enabled: bool,
 ) -> WriteResult:
-    cfg_path = os.path.join(data_dir, _OBS_CONFIG_FILE_NAME)
+    cfg_path = str(config_path_for_data_dir(data_dir))
     with locked_config_yaml(cfg_path):
         raw = _obs_load_raw(cfg_path)
         sinks = _connector_audit_sinks_list(raw, connector, create=False)
@@ -1178,7 +1173,7 @@ def _set_connector_sink_enabled(
 
 
 def _remove_connector_sink(data_dir: str, connector: str, name: str) -> WriteResult:
-    cfg_path = os.path.join(data_dir, _OBS_CONFIG_FILE_NAME)
+    cfg_path = str(config_path_for_data_dir(data_dir))
     with locked_config_yaml(cfg_path):
         raw = _obs_load_raw(cfg_path)
         sinks = _connector_audit_sinks_list(raw, connector, create=False)
@@ -1212,24 +1207,14 @@ def _slug(value: str) -> str:
 
 
 def _write_atomically(cfg_path: str, raw: dict[str, Any]) -> None:
-    import yaml
+    """Compatibility wrapper around the authoritative secure config writer.
 
-    # Create the staging file with ``tempfile.mkstemp`` (``O_EXCL``, 0600)
-    # in the target dir instead of a predictable ``<cfg>.tmp`` name: a
-    # predictable temp path is symlink/pre-create-able by a local attacker
-    # and this config can carry HEC/OTLP tokens (F-0186).
-    directory = os.path.dirname(cfg_path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(raw, f, default_flow_style=False, sort_keys=False)
-        os.replace(tmp, cfg_path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    Older callers and the F-0186 regression test import this private helper.
+    Keeping the shim avoids splitting atomic-write behavior while ensuring all
+    writes use the managed-mode authorization and mode-preservation checks in
+    :func:`write_config_yaml_secure`.
+    """
+    write_config_yaml_secure(cfg_path, raw)
 
 
 # ---------------------------------------------------------------------------
