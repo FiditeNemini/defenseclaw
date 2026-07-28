@@ -101,35 +101,26 @@ namespace or an exact same-commit tag with no release, allowing recovery from a
 failure that occurred before publication began. Creating either namespace
 requires the selected commit to remain reachable from protected `main`.
 
-Repository rules must protect `release-channel` according to
-[`release/release-channel-ruleset-policy.json`](../release/release-channel-ruleset-policy.json):
-one active exact-ref ruleset restricts creation, updates, deletion, and
-non-fast-forward changes, with only the reviewed GitHub Actions integration as
-publisher bypass. It is organization-sourced and targets only the
-`defenseclaw` repository because GitHub does not accept its Actions integration
-as a bypass actor on a repository-sourced ruleset. The release workflow's
-protected `release` environment is the intended publisher. Git history
-provides an audit trail, while the Sigstore proof prevents an unsigned branch
-edit from redirecting clients.
+Both operations use the same simple manual dispatch from `main`: select
+`operation=release` or `operation=repair-channel` and enter the bare `X.Y.Z`
+version. That action is the operator's authorization. GitHub automatically
+freezes the event's exact `github.sha`; no copied commit SHA, repository-setting
+confirmation, or local preflight is required.
 
-Before either operation, run the fail-closed operator preflight from clean,
-current `main`:
+A `release-channel` branch ruleset is optional hardening. It can reduce
+accidental deletion or rewrites and improve the Git audit trail, but it is not
+a release prerequisite or client trust boundary; an operator does not need to
+create one before release. This relies on protected `main`, its required checks,
+and the reviewed release workflow and signing identity remaining protected from
+administrator-level bypass. A channel ruleset alone cannot defend against an
+administrator who can rewrite those publishing authorities.
 
-```bash
-# Normal release:
-python3 scripts/release-preflight.py operator \
-  --operation release \
-  --version 0.8.8 \
-  --immutable-releases-confirmed true
-
-# Stable-channel-only repair:
-python3 scripts/release-preflight.py operator \
-  --operation repair-channel \
-  --version 0.8.8
-```
-
-The command verifies the live ruleset and target authority and prints, but
-does not execute, the corresponding workflow dispatch.
+With those authorities intact, someone limited to editing the channel can
+delete the pointer or replay an older valid signed document, causing
+availability or freshness problems. They cannot make clients accept an
+unsigned or modified document: clients require the release workflow's Sigstore
+identity, then require its SHA-256 bindings to immutable versioned resolver,
+installer, and payload assets.
 
 ## Rescue behavior
 
@@ -228,9 +219,13 @@ installation remains owned by the authenticated target installer.
 - An unsigned channel edit, arbitrary URL, changed resolver or installer name,
   tag/ref mismatch, same-version digest change, or rollback publication is
   rejected.
-- A repository administrator could replay an older, previously valid signed
-  channel by bypassing branch rules. That is a freshness/availability risk,
-  not authority to execute modified bytes: the resolver is still an immutable
-  signed release asset, and normal upgrade policy refuses downgrades.
+- While protected `main`, required checks, and the release workflow/signing
+  identity remain intact, someone limited to editing the channel could delete
+  it or replay an older, previously valid signed document. That is a
+  freshness/availability risk, not authority to execute modified bytes: the
+  resolver is still an immutable signed release asset, and normal upgrade
+  policy refuses downgrades. An administrator able to bypass or rewrite those
+  publishing authorities can change the trusted publisher regardless of a
+  channel ruleset.
 - Windows rescue delegates to native Setup and its signed release contract;
   it supports native Windows x64 only. macOS and Linux use the POSIX rescue.
