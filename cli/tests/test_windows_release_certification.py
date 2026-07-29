@@ -333,3 +333,19 @@ def test_setup_uninstall_acceptance_retains_connector_cleanup_authority() -> Non
     assert "Get-NativeConnectorBackupMarkers" in consumed
     assert "Assert-NativeConnectorCleanupAuthorityPresent $dataRoot $repairedRoster" in acceptance
     assert "Assert-NativeConnectorBackupMarkersConsumed $dataRoot" in acceptance
+
+
+def test_setup_uninstall_acceptance_separates_signed_cli_from_unsigned_fixture() -> None:
+    acceptance = _function("Invoke-SetupAcceptance")
+
+    assert "if ($requireSignedProduct)" in acceptance
+    assert "'uninstall', '--all', '--yes'" in acceptance
+    assert "restart required.*3010" in acceptance
+    assert "Native installer state is not an authenticated signed user installation" in acceptance
+    assert "unsigned native CLI refusal mutated installed state" in acceptance
+    assert "Invoke-WindowsSetupStandardUserProcess $cachedSetup" in acceptance
+    assert "'/uninstall', '/quiet', 'DELETEUSERDATA=1'" in acceptance
+    assert acceptance.count("-AllowedExitCodes @(3010)") >= 3
+    assert "RegistryValueOptions]::DoNotExpandEnvironmentNames" in acceptance
+    assert "RegistryValueKind]::String" in acceptance
+    assert "Run value is not the exact absolute cached Setup command" in acceptance

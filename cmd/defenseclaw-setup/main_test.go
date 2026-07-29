@@ -18,7 +18,49 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/defenseclaw/defenseclaw/internal/hookruntime"
 )
+
+func TestHookLauncherPayloadInterfaceIsCanonicalAndRequired(t *testing.T) {
+	manifest := payloadManifest{Files: map[string]string{}}
+	if !slices.Contains(requiredPayloadFiles(manifest), hookruntime.HookLauncherName) {
+		t.Fatal("canonical stable hook trampoline payload is not required")
+	}
+	_, complete := unsignedManifestFixture(t)
+	delete(complete.Files, hookruntime.HookLauncherName)
+	if err := verifyPayloadManifest(t.TempDir(), complete); err == nil ||
+		!strings.Contains(err.Error(), hookruntime.HookLauncherName) {
+		t.Fatalf("verifyPayloadManifest missing-launcher error = %v", err)
+	}
+}
+
+func TestStageHookLauncherCopiesCanonicalPayloadToInstalledSource(t *testing.T) {
+	payloadRoot := t.TempDir()
+	staging := t.TempDir()
+	source := filepath.Join(payloadRoot, hookruntime.HookLauncherName)
+	want := []byte("MZ-stable-hook-trampoline")
+	if err := os.WriteFile(source, want, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := loadedPayload{
+		Root: payloadRoot,
+		Manifest: payloadManifest{Files: map[string]string{
+			hookruntime.HookLauncherName: strings.Repeat("a", 64),
+		}},
+	}
+	if err := stageHookLauncher(payload, staging); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(staging, "bin", hookruntime.HookLauncherName)
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("installed stable hook source = %q, want %q", got, want)
+	}
+}
 
 func TestRenameInstallTreeRetriesTransientErrors(t *testing.T) {
 	for _, errno := range []syscall.Errno{5, 32, 33} {
@@ -145,6 +187,37 @@ func TestParseArgsVerifyAction(t *testing.T) {
 	}
 	if opts.Action != "verify" {
 		t.Fatalf("action = %q, want verify", opts.Action)
+	}
+}
+
+func TestParseArgsDeferredCleanupQuietRestartContract(t *testing.T) {
+	transactionID := "0123456789abcdef0123456789abcdef"
+	opts, err := parseArgs([]string{
+		"/cleanup",
+		"/quiet",
+		"CLEANUPTRANSACTION=" + transactionID,
+	})
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if opts.Action != "cleanup" || !opts.Quiet || opts.CleanupTransaction != transactionID {
+		t.Fatalf("deferred cleanup options parsed incorrectly: %+v", opts)
+	}
+	if restartRequiredCode != 3010 {
+		t.Fatalf("restart-required exit code = %d, want Windows 3010", restartRequiredCode)
+	}
+	for _, args := range [][]string{
+		{"/cleanup", "/quiet"},
+		{"/cleanup", "CLEANUPTRANSACTION=invalid"},
+		{"/uninstall", "CLEANUPTRANSACTION=" + transactionID},
+		{"/cleanup", "/quiet", "CLEANUPTRANSACTION=" + transactionID, "DELETEUSERDATA=1"},
+		{"/quiet", "/cleanup", "CLEANUPTRANSACTION=" + transactionID},
+		{"/cleanup", "/quiet", "cleanuptransaction=" + transactionID},
+		{"/cleanup", "/quiet", "CLEANUPTRANSACTION=" + transactionID, "CLEANUPTRANSACTION=" + transactionID},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Fatalf("parseArgs accepted invalid cleanup invocation: %v", args)
+		}
 	}
 }
 

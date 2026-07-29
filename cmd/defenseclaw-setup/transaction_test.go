@@ -29,6 +29,17 @@ func testTransactionRoots(t *testing.T) (string, string, string) {
 		filepath.Join(root, "DefenseClaw", "InstallerCache", setupArtifactName)
 }
 
+func bypassDeferredUninstallCleanupForTest(t *testing.T) {
+	t.Helper()
+	original := deferredCleanupTransactionRootExpectation
+	deferredCleanupTransactionRootExpectation = func(setupTransaction) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() {
+		deferredCleanupTransactionRootExpectation = original
+	})
+}
+
 func testInstallState(installRoot, dataRoot, maintenancePath, transactionID, version string) installState {
 	return installState{
 		SchemaVersion:          1,
@@ -300,6 +311,7 @@ func TestCommittedUninstallCleanupConvergesAfterRename(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows delayed maintenance-cache cleanup")
 	}
+	bypassDeferredUninstallCleanupForTest(t)
 	installRoot, dataRoot, maintenancePath := testTransactionRoots(t)
 	previous := testInstallState(installRoot, dataRoot, maintenancePath, testPreviousTransactionID, "1.0.0")
 	transaction := testSetupTransactionForRoots("uninstall", installRoot, dataRoot, maintenancePath, &previous)
@@ -332,6 +344,7 @@ func TestCommittedUninstallCleanupConvergesAfterRename(t *testing.T) {
 }
 
 func TestCommittedUninstallCleanupPreservesDataForPendingConnectorReconciliation(t *testing.T) {
+	bypassDeferredUninstallCleanupForTest(t)
 	installRoot, dataRoot, maintenancePath := testTransactionRoots(t)
 	transaction := testSetupTransactionForRoots("uninstall", installRoot, dataRoot, maintenancePath, nil)
 	transaction.DeleteUserData = true
@@ -363,6 +376,7 @@ func TestCommittedUninstallCleanupPreservesDataForPendingConnectorReconciliation
 }
 
 func TestCommittedUninstallCleanupFinishesPartiallyDeletedTrash(t *testing.T) {
+	bypassDeferredUninstallCleanupForTest(t)
 	installRoot, dataRoot, maintenancePath := testTransactionRoots(t)
 	previous := testInstallState(installRoot, dataRoot, maintenancePath, testPreviousTransactionID, "1.0.0")
 	transaction := testSetupTransactionForRoots("uninstall", installRoot, dataRoot, maintenancePath, &previous)
@@ -972,7 +986,39 @@ func TestRecoverSetupJournalPhaseRetainsCommittedOnConvergenceFailure(t *testing
 	}
 }
 
-func TestRecoverSetupJournalPhaseLeavesConvergedDuringDeferredCleanup(t *testing.T) {
+func TestRecoverSetupJournalPhaseRetainsConvergedUninstallWhileRestartIsRequired(t *testing.T) {
+	transaction := testSetupTransactionForRoots("uninstall", "root", "data", "maintenance", nil)
+	cleanupCalls := 0
+	transitioned := false
+	ops := setupRecoveryOps{
+		Rollback: func(setupTransaction) error { return nil },
+		Converge: func(setupTransaction) error { return nil },
+		Cleanup: func(setupTransaction) error {
+			cleanupCalls++
+			return errUninstallCleanupRequiresRestart
+		},
+		Transition: func(setupTransaction, string, string) error {
+			transitioned = true
+			return nil
+		},
+	}
+	journal := setupJournal{
+		SchemaVersion: setupJournalSchemaVersion,
+		Phase:         setupPhaseConverged,
+		Transaction:   transaction,
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		err := recoverSetupJournalPhase(journal, ops)
+		if !errors.Is(err, errUninstallCleanupRequiresRestart) || transitioned {
+			t.Fatalf("attempt %d recovery error = %v, transitioned = %v", attempt, err, transitioned)
+		}
+	}
+	if cleanupCalls != 2 {
+		t.Fatalf("same-boot recovery cleanup calls = %d, want 2", cleanupCalls)
+	}
+}
+
+func TestRecoverSetupJournalPhaseCompletesPostExitCleanup(t *testing.T) {
 	transaction := testSetupTransactionForRoots("uninstall", "root", "data", "maintenance", nil)
 	transitioned := false
 	err := recoverSetupJournalPhase(setupJournal{
@@ -983,13 +1029,46 @@ func TestRecoverSetupJournalPhaseLeavesConvergedDuringDeferredCleanup(t *testing
 		Rollback: func(setupTransaction) error { return nil },
 		Converge: func(setupTransaction) error { return nil },
 		Cleanup:  func(setupTransaction) error { return errTransactionCleanupDeferred },
-		Transition: func(setupTransaction, string, string) error {
+		Transition: func(_ setupTransaction, from, to string) error {
+			if from != setupPhaseConverged || to != setupPhaseComplete {
+				t.Fatalf("transition = %s -> %s", from, to)
+			}
 			transitioned = true
 			return nil
 		},
 	})
-	if !errors.Is(err, errTransactionCleanupDeferred) || transitioned {
+	if err != nil || !transitioned {
 		t.Fatalf("recovery error = %v, transitioned = %v", err, transitioned)
+	}
+}
+
+func TestFinishCommittedSetupTransactionReturns3010WithoutTerminalizing(t *testing.T) {
+	transaction := testSetupTransactionForRoots("uninstall", "root", "data", "maintenance", nil)
+	var calls []string
+	restartRequired, err := finishCommittedSetupTransactionWith(
+		transaction,
+		func(setupTransaction) error {
+			calls = append(calls, "converge")
+			return nil
+		},
+		func(setupTransaction) error {
+			calls = append(calls, "mark-converged")
+			return nil
+		},
+		func(setupTransaction) error {
+			calls = append(calls, "arm-cleanup")
+			return errUninstallCleanupRequiresRestart
+		},
+		func(setupTransaction) error {
+			calls = append(calls, "mark-complete")
+			return nil
+		},
+	)
+	if err != nil || !restartRequired {
+		t.Fatalf("finish result = restart %v, error %v", restartRequired, err)
+	}
+	if got, want := strings.Join(calls, ","), "converge,mark-converged,arm-cleanup"; got != want {
+		t.Fatalf("finish calls = %q, want %q", got, want)
 	}
 }
 
