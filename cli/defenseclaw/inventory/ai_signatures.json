@@ -47,7 +47,18 @@
         "package-id:OpenAI.Codex_2p2nqsd0c76g0",
         "package-id:OpenAI.CodexBeta_2p2nqsd0c76g0"
       ],
-      "local_endpoints": []
+      "local_endpoints": [],
+      "skill_paths": [
+        "~/.codex/skills",
+        ".codex/skills"
+      ],
+      "rule_paths": [
+        "~/.codex/rules",
+        ".codex/rules"
+      ],
+      "plugin_paths": [
+        "~/.codex/plugins"
+      ]
     },
     {
       "id": "claudecode",
@@ -95,8 +106,16 @@
         "claude",
         "anthropic"
       ],
-      "application_names": [],
-      "local_endpoints": []
+      "application_names": [
+        "Claude.app"
+      ],
+      "local_endpoints": [],
+      "skill_paths": [
+        "~/.claude/skills"
+      ],
+      "rule_paths": [
+        "~/.claude/rules"
+      ]
     },
     {
       "id": "openclaw",
@@ -127,7 +146,10 @@
         "openclaw"
       ],
       "application_names": [],
-      "local_endpoints": []
+      "local_endpoints": [],
+      "plugin_paths": [
+        "~/.openclaw/plugins"
+      ]
     },
     {
       "id": "zeptoclaw",
@@ -201,7 +223,17 @@
         "hermes agent"
       ],
       "application_names": [],
-      "local_endpoints": []
+      "local_endpoints": [],
+      "skill_paths": [
+        "$HERMES_HOME/skills",
+        "$LOCALAPPDATA/hermes/skills",
+        "~/.hermes/skills"
+      ],
+      "plugin_paths": [
+        "$HERMES_HOME/plugins",
+        "$LOCALAPPDATA/hermes/plugins",
+        "~/.hermes/plugins"
+      ]
     },
     {
       "id": "cursor",
@@ -249,7 +281,11 @@
         "Cursor.app",
         "Cursor"
       ],
-      "local_endpoints": []
+      "local_endpoints": [],
+      "rule_paths": [
+        "~/.cursor/rules",
+        ".cursor/rules"
+      ]
     },
     {
       "id": "windsurf",
@@ -297,7 +333,11 @@
         "Windsurf.app",
         "Windsurf"
       ],
-      "local_endpoints": []
+      "local_endpoints": [],
+      "rule_paths": [
+        ".windsurf/rules",
+        ".codeium/windsurf/rules"
+      ]
     },
     {
       "id": "geminicli",

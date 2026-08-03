@@ -780,6 +780,84 @@ resolve_aid_endpoint() {
   aid_endpoint_for_env "${env}"
 }
 
+# move_legacy_aside PATH BACKUP_ROOT VERSION [--dry-run] -> stdout log message.
+#
+# Idempotent installer helper for the "reconcile in place" path: relocate a
+# legacy DefenseClaw location under BACKUP_ROOT with a
+# .pre-<version>-<timestamp> suffix instead of deleting it. Missing PATH is a
+# no-op; missing BACKUP_ROOT returns rc 3; a symlinked BACKUP_ROOT returns rc 4
+# (mv into a symlink would follow the link). Callers get preserved rollback
+# state and a fresh install landing zone without touching user data.
+move_legacy_aside() {
+  local path="$1" backup_root="$2" version="$3"
+  shift 3
+  local dry_run="false"
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --dry-run) dry_run="true";;
+      *) return 2;;
+    esac
+  done
+
+  if [[ -z "${path}" || -z "${backup_root}" || -z "${version}" ]]; then
+    return 2
+  fi
+
+  # Reject a version string that could path-traverse the target. version
+  # flows into ${target}=${backup_root}/${base}.pre-${version}-${timestamp}
+  # verbatim; a version containing '/' or '..' (e.g. a malformed
+  # --version output captured unsanitized) would escape the backup_root.
+  # Whitespace and shell metacharacters are also refused so `printf` /
+  # `mv` cannot be steered by callers that failed to trim their input.
+  if [[ "${version}" == */* || "${version}" == *".."* ]] \
+      || [[ "${version}" =~ [[:space:][:cntrl:]\"\'\\\$\`\;\|\&\<\>] ]]; then
+    return 2
+  fi
+
+  if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+    return 0
+  fi
+
+  # Reject a symlinked BACKUP_ROOT outright — mv into a symlink
+  # target would follow the link and relocate legacy state into
+  # whatever the symlink points at.
+  if [[ -L "${backup_root}" ]]; then
+    return 4
+  fi
+
+  local base timestamp target
+  base="$(basename -- "${path}")"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo "unknown")"
+  target="${backup_root}/${base}.pre-${version}-${timestamp}"
+
+  if [[ "${dry_run}" == "true" ]]; then
+    printf '[install] would move legacy path aside: %s -> %s\n' "${path}" "${target}"
+    return 0
+  fi
+
+  if [[ ! -d "${backup_root}" ]]; then
+    return 3
+  fi
+
+  # Collision suffix in case of same-second re-runs.
+  local suffix=""
+  local i
+  for (( i = 0; i < 100; i++ )); do
+    if [[ ! -e "${target}${suffix}" && ! -L "${target}${suffix}" ]]; then
+      break
+    fi
+    suffix=".${i}"
+  done
+  target="${target}${suffix}"
+
+  if ! /bin/mv -- "${path}" "${target}" 2>/dev/null; then
+    return 4
+  fi
+  printf '[install] moved legacy path aside: %s -> %s\n' "${path}" "${target}"
+  return 0
+}
+
 # render_config MODE PRIMARY API_PORT SUPPORT_DIR AID_ENDPOINT CONN... -> stdout
 # Renders the full config.yaml. Pure stdout, no file writes.
 # Extra args after AID_ENDPOINT are the full connector list (primary + others).
