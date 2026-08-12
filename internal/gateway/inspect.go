@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/defenseclaw/defenseclaw/internal/actionfacts"
@@ -123,6 +124,11 @@ type ToolInspectVerdict struct {
 	// ctx / emitted events. Tri-state (nil/true/false); never
 	// serialized on the hook response wire.
 	RedactionEnabled *bool `json:"-"`
+	// managedAIDFailOpenReason is an internal accounting marker. The generic
+	// HTTP handler consumes it only after selecting an allow result, so
+	// a timed-out request that the connector fails closed cannot be counted as
+	// a fail-open allow decision. It is never serialized.
+	managedAIDFailOpenReason string
 }
 
 // applyMode stamps the active guardrail mode onto the verdict and,
@@ -211,11 +217,138 @@ func (a *APIServer) managedAIDOnly() bool {
 // down / timeout / token failure — hookAIDInspect returns nil), the request
 // fails open with an explicit allow verdict.
 func (a *APIServer) inspectManagedAIDOnly(ctx context.Context, toolName, content string) *ToolInspectVerdict {
+	failOpenReason := aidFailOpenUnavailable
+	if !managedAIDHookContentIsInspectable(toolName, content) {
+		failOpenReason = aidFailOpenNoContent
+	} else if a == nil || a.ciscoInspector == nil || a.scannerCfg == nil ||
+		!a.scannerCfg.CiscoAIDefense.HookSurfaceEnabled() {
+		failOpenReason = aidFailOpenUnwired
+	}
 	aid := a.hookAIDInspect(ctx, toolName, content)
 	if aid == nil {
-		return &ToolInspectVerdict{Action: "allow", Severity: "NONE", Findings: []string{}}
+		verdict := &ToolInspectVerdict{
+			Action:                   "allow",
+			Severity:                 "NONE",
+			Findings:                 []string{},
+			managedAIDFailOpenReason: failOpenReason,
+		}
+		if gate := managedAIDFailOpenNativeHookGateFromContext(ctx); gate != nil {
+			gate.enqueue(verdict)
+		} else if !managedAIDFailOpenAccountingDeferred(ctx) {
+			a.recordManagedAIDFailOpenVerdict(ctx, verdict)
+		}
+		return verdict
 	}
 	return mergeWithAIDVerdict(nil, aid)
+}
+
+type managedAIDFailOpenAccountingContextKey struct{}
+
+type managedAIDFailOpenNativeHookGateContextKey struct{}
+
+// managedAIDFailOpenNativeHookGate holds fail-open candidates until the
+// unified native-hook owner has selected the final effective response. Native
+// evaluation can inspect more than one segment, so the gate preserves proposal
+// order and consumes the whole batch exactly once.
+type managedAIDFailOpenNativeHookGate struct {
+	mu       sync.Mutex
+	pending  []*ToolInspectVerdict
+	consumed bool
+}
+
+func deferManagedAIDFailOpenAccounting(ctx context.Context) context.Context {
+	return context.WithValue(ctx, managedAIDFailOpenAccountingContextKey{}, true)
+}
+
+func deferManagedAIDFailOpenNativeHookAccounting(
+	ctx context.Context,
+) (context.Context, *managedAIDFailOpenNativeHookGate) {
+	gate := &managedAIDFailOpenNativeHookGate{}
+	ctx = deferManagedAIDFailOpenAccounting(ctx)
+	return context.WithValue(ctx, managedAIDFailOpenNativeHookGateContextKey{}, gate), gate
+}
+
+func managedAIDFailOpenNativeHookGateFromContext(
+	ctx context.Context,
+) *managedAIDFailOpenNativeHookGate {
+	if ctx == nil {
+		return nil
+	}
+	gate, _ := ctx.Value(managedAIDFailOpenNativeHookGateContextKey{}).(*managedAIDFailOpenNativeHookGate)
+	return gate
+}
+
+func (gate *managedAIDFailOpenNativeHookGate) enqueue(verdict *ToolInspectVerdict) {
+	if gate == nil || verdict == nil || verdict.managedAIDFailOpenReason == "" {
+		return
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.consumed {
+		verdict.managedAIDFailOpenReason = ""
+		return
+	}
+	gate.pending = append(gate.pending, verdict)
+}
+
+func (gate *managedAIDFailOpenNativeHookGate) consume(selectedAllow bool) []*ToolInspectVerdict {
+	if gate == nil {
+		return nil
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.consumed {
+		return nil
+	}
+	gate.consumed = true
+	pending := gate.pending
+	gate.pending = nil
+	if selectedAllow {
+		return pending
+	}
+	for _, verdict := range pending {
+		if verdict != nil {
+			verdict.managedAIDFailOpenReason = ""
+		}
+	}
+	return nil
+}
+
+func managedAIDFailOpenAccountingDeferred(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	deferred, _ := ctx.Value(managedAIDFailOpenAccountingContextKey{}).(bool)
+	return deferred
+}
+
+func (a *APIServer) recordManagedAIDFailOpenVerdict(ctx context.Context, verdict *ToolInspectVerdict) {
+	if a == nil || verdict == nil || verdict.managedAIDFailOpenReason == "" {
+		return
+	}
+	reason := verdict.managedAIDFailOpenReason
+	verdict.managedAIDFailOpenReason = ""
+	metricRuntime, _ := a.observabilityV8LifecycleRuntime().(hookLifecycleMetricV8Runtime)
+	if metricRuntime != nil {
+		_ = recordManagedAIDFailOpenMetricV8(ctx, metricRuntime, reason)
+	}
+}
+
+func (a *APIServer) recordManagedAIDFailOpenForSelectedNativeHookResult(
+	ctx context.Context,
+	gate *managedAIDFailOpenNativeHookGate,
+	action string,
+	panicked bool,
+) {
+	pending := gate.consume(!panicked && action == "allow")
+	if len(pending) == 0 {
+		return
+	}
+	metricCtx, cancelMetric := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancelMetric()
+	for _, verdict := range pending {
+		a.recordManagedAIDFailOpenVerdict(metricCtx, verdict)
+	}
 }
 
 func (a *APIServer) hookAIDInspect(ctx context.Context, toolName string, content string) *ScanVerdict {
@@ -225,7 +358,7 @@ func (a *APIServer) hookAIDInspect(ctx context.Context, toolName string, content
 	if a.scannerCfg == nil || !a.scannerCfg.CiscoAIDefense.HookSurfaceEnabled() {
 		return nil
 	}
-	if content == "" {
+	if !managedAIDHookContentIsInspectable(toolName, content) {
 		return nil
 	}
 	// Prepend the tool name to the content so AID classifiers that
@@ -238,6 +371,17 @@ func (a *APIServer) hookAIDInspect(ctx context.Context, toolName string, content
 		body = fmt.Sprintf("Tool call: %s\n%s", toolName, content)
 	}
 	return a.ciscoInspector.Inspect(ctx, []ChatMessage{{Role: "user", Content: body}})
+}
+
+// managedAIDHookContentIsInspectable applies text trimming only to the
+// message hook, whose Content is sent to AID verbatim. Named tool calls keep
+// their established exact-empty check: non-empty argument whitespace is
+// still combined with the tool name below and remains policy-inspectable.
+func managedAIDHookContentIsInspectable(toolName, content string) bool {
+	if toolName == "message" {
+		return managedAIDContentIsInspectable(content)
+	}
+	return content != ""
 }
 
 // mergeWithAIDVerdict folds an AID ScanVerdict into an existing
@@ -766,10 +910,6 @@ func (a *APIServer) inspectMessageContent(ctx context.Context, req *ToolInspectR
 		}
 	}
 
-	if content == "" {
-		return &ToolInspectVerdict{Action: "allow", Severity: "NONE", Findings: []string{}}
-	}
-
 	// managed_enterprise: Cisco AI Defense is the sole decision-maker.
 	// Skip the connector regex packs and the judge lane; AID inspects the
 	// message content directly and a nil AID verdict fails open.
@@ -779,6 +919,10 @@ func (a *APIServer) inspectMessageContent(ctx context.Context, req *ToolInspectR
 			clampSourceScopeVerdict(verdict)
 		}
 		return verdict
+	}
+
+	if content == "" {
+		return &ToolInspectVerdict{Action: "allow", Severity: "NONE", Findings: []string{}}
 	}
 
 	// Outbound messages get the full scan — tool name "message" for context.
@@ -1054,6 +1198,7 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), scanTimeout)
 	defer cancel()
+	workerCtx := deferManagedAIDFailOpenAccounting(ctx)
 
 	fmt.Fprintf(os.Stderr, "[inspect] >>> tool=%q args=%s content_len=%d direction=%s\n",
 		req.Tool, redaction.MessageContent(string(req.Args)), len(req.Content), req.Direction)
@@ -1064,16 +1209,20 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 		v *ToolInspectVerdict
 	}
 	ch := make(chan verdictResult, 1)
+	workerDone := a.inspectToolWorkerDone
 	go func() {
+		if workerDone != nil {
+			defer workerDone()
+		}
 		var v *ToolInspectVerdict
 		if strings.EqualFold(req.Tool, "message") {
-			v = a.inspectMessageContent(ctx, &req)
+			v = a.inspectMessageContent(workerCtx, &req)
 		} else {
 			// Pass the 200ms-capped ctx so the tool-call judge lane's
 			// deadline guard short-circuits on this generic endpoint
 			// (mirroring the message lane); native hook callers go
 			// through inspectToolPolicy with a deadline-free context.
-			v = a.inspectToolPolicyCtx(ctx, &req)
+			v = a.inspectToolPolicyCtx(workerCtx, &req)
 		}
 		ch <- verdictResult{v}
 	}()
@@ -1198,6 +1347,11 @@ func (a *APIServer) handleInspectTool(w http.ResponseWriter, r *http.Request) {
 				verdict.Severity, r.RemoteAddr, strings.TrimSpace(verdict.Reason) != "",
 				len(verdict.DetailedFindings)))
 	}
+	// The worker only classifies the managed AID fail-open reason. Account for
+	// it after this handler has selected the allow result; the 504
+	// path returns above and deliberately records nothing because installed
+	// hooks fail closed on an unreachable gateway.
+	a.recordManagedAIDFailOpenForSelectedGenericResult(r.Context(), verdict)
 	a.writeJSON(w, http.StatusOK, responseVerdict)
 }
 
