@@ -41,6 +41,14 @@ if (-not ('DefenseClaw.SetupStandardUserLauncher' -as [type])) {
     Add-Type -Path $setupStandardUserLauncherSource
 }
 
+$disposableFileGuardSource = Join-Path $PSScriptRoot 'windows-disposable-file-guard.cs'
+if (-not ('DefenseClaw.DisposableFileGuard' -as [type])) {
+    if (-not (Test-Path -LiteralPath $disposableFileGuardSource -PathType Leaf)) {
+        throw "Windows disposable file guard source is missing: $disposableFileGuardSource"
+    }
+    Add-Type -Path $disposableFileGuardSource
+}
+
 function Get-RedactionValues {
     $names = @(
         'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AMP_API_KEY', 'AZURE_OPENAI_API_KEY',
@@ -5879,23 +5887,54 @@ function Stop-StateProcesses([string]$Root) {
     if ($remaining.Count) { throw "isolated process cleanup timed out: $($remaining -join ', ')" }
 }
 
+function Test-WindowsNativeReparsePoint([IO.FileSystemInfo]$Item) {
+    return (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
 function Get-WindowsNativeCaptureFiles([string]$Root) {
     if (-not (Test-Path -LiteralPath $Root)) { return @() }
-    return @(
-        Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -match '^(gateway|watchdog|results|doctor|.*\.log)' -and
-                    $_.Length -le 1048576
-            } |
-            Sort-Object @{
-                Expression = {
-                    if ($_.Name -eq 'wizard-driver.log') { 0 }
-                    elseif ($_.Name -in @('go-test-failure-summary.log', 'go-test.log')) { 1 }
-                    else { 2 }
-                }
-            }, FullName |
-            Select-Object -First 30
+    try {
+        $rootItem = [IO.DirectoryInfo](Get-Item -LiteralPath $Root -Force -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+    if (Test-WindowsNativeReparsePoint $rootItem) { return @() }
+
+    $pending = [Collections.Generic.Queue[IO.DirectoryInfo]]::new()
+    $pending.Enqueue($rootItem)
+    $selected = [Collections.Generic.SortedDictionary[string, IO.FileInfo]]::new(
+        [StringComparer]::OrdinalIgnoreCase
     )
+    $selectionLimit = 30
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Dequeue()
+        if (Test-WindowsNativeReparsePoint $directory) { continue }
+        try {
+            $children = @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction SilentlyContinue)
+        } catch {
+            continue
+        }
+        foreach ($child in $children) {
+            if (Test-WindowsNativeReparsePoint $child) { continue }
+            if ($child.PSIsContainer) {
+                $pending.Enqueue([IO.DirectoryInfo]$child)
+            } elseif ($child -is [IO.FileInfo] -and
+                $child.Name -match '^(gateway|watchdog|results|doctor|.*\.log)' -and
+                $child.Length -le 1048576) {
+                $priority = if ($child.Name -eq 'wizard-driver.log') { 0 }
+                    elseif ($child.Name -in @('go-test-failure-summary.log', 'go-test.log')) { 1 }
+                    else { 2 }
+                $selectionKey = '{0}|{1}' -f $priority, $child.FullName
+                $selected[$selectionKey] = [IO.FileInfo]$child
+                if ($selected.Count -gt $selectionLimit) {
+                    $lastKey = @($selected.Keys)[-1]
+                    [void]$selected.Remove($lastKey)
+                }
+            }
+        }
+    }
+
+    return @($selected.Values)
 }
 
 function Invoke-Capture {
@@ -5919,9 +5958,26 @@ function Invoke-Capture {
     }
     Write-BoundedText (Join-Path $destination 'listeners.txt') ($listeners -join [Environment]::NewLine)
     if (Test-Path -LiteralPath $root) {
-        foreach ($file in @(Get-WindowsNativeCaptureFiles $root)) {
-            $relative = [IO.Path]::GetRelativePath($root, $file.FullName) -replace '[\\/:*?"<>|]', '_'
-            Write-BoundedText (Join-Path $destination $relative) ([IO.File]::ReadAllText($file.FullName))
+        $captureReader = $null
+        try {
+            $captureReader = [DefenseClaw.DisposableFileGuard]::OpenRootedReader($root)
+        } catch {
+            $captureReader = $null
+        }
+        if ($null -ne $captureReader) {
+            try {
+                foreach ($file in @(Get-WindowsNativeCaptureFiles $root)) {
+                    try {
+                        $capturedText = $captureReader.ReadBoundedUtf8($file.FullName, 1048576)
+                    } catch {
+                        continue
+                    }
+                    $relative = [IO.Path]::GetRelativePath($root, $file.FullName) -replace '[\\/:*?"<>|]', '_'
+                    Write-BoundedText (Join-Path $destination $relative) $capturedText
+                }
+            } finally {
+                $captureReader.Dispose()
+            }
         }
     }
 }
@@ -5973,6 +6029,9 @@ function Invoke-SelfTest {
     $boundedLimit = 256
     $boundedSecret = 'bounded-secret-value'
     $captureFixture = Join-Path $root 'bounded-capture-selection'
+    $symlinkTarget = $null
+    $outsideCaptureRoot = $null
+    $captureReader = $null
     $originalBoundedSecret = [Environment]::GetEnvironmentVariable('DC_E2E_TEST_SECRET')
     try {
         $env:DC_E2E_TEST_SECRET = $boundedSecret
@@ -6158,6 +6217,14 @@ function Invoke-SelfTest {
             [IO.FileShare]::None
         )
         try { $oversized.SetLength(1048577) } finally { $oversized.Dispose() }
+        $outsideCaptureRoot = Join-Path ([IO.Path]::GetTempPath()) (
+            'defenseclaw-native-capture-outside-' + [guid]::NewGuid().ToString('N')
+        )
+        [IO.Directory]::CreateDirectory($outsideCaptureRoot) | Out-Null
+        $symlinkTarget = Join-Path $outsideCaptureRoot 'outside-capture-secret.bin'
+        $symlinkPath = Join-Path $captureFixture 'doctor.log'
+        Set-Content -LiteralPath $symlinkTarget -Value 'sensitive diagnostic fixture' -NoNewline
+        New-Item -ItemType SymbolicLink -Path $symlinkPath -Target $symlinkTarget -ErrorAction Stop | Out-Null
 
         $captureFiles = @(Get-WindowsNativeCaptureFiles $root)
         if (-not ($captureFiles | Where-Object {
@@ -6175,10 +6242,76 @@ function Invoke-SelfTest {
         }) {
             throw 'oversized diagnostic bypassed the native capture size guard'
         }
+        if ($captureFiles | Where-Object {
+            $_.FullName.Equals($symlinkPath, [StringComparison]::OrdinalIgnoreCase)
+        }) {
+            throw 'reparse-point diagnostic bypassed the native capture symlink guard'
+        }
+
+        $captureReader = [DefenseClaw.DisposableFileGuard]::OpenRootedReader($captureFixture)
+        $guardedBoundedText = $captureReader.ReadBoundedUtf8($boundedPath, 1048576)
+        if ($guardedBoundedText -cne [IO.File]::ReadAllText($boundedPath)) {
+            throw 'capture retained-root reader changed a verified regular diagnostic'
+        }
+        $leafSwapRoot = Join-Path $captureFixture 'leaf-swap'
+        [IO.Directory]::CreateDirectory($leafSwapRoot) | Out-Null
+        $leafSwapPath = Join-Path $leafSwapRoot 'wizard-driver.log'
+        Set-Content -LiteralPath $leafSwapPath -Value 'safe diagnostic fixture' -NoNewline
+        $leafCandidate = @(Get-WindowsNativeCaptureFiles $leafSwapRoot) |
+            Where-Object {
+                $_.FullName.Equals($leafSwapPath, [StringComparison]::OrdinalIgnoreCase)
+            } |
+            Select-Object -First 1
+        if ($null -eq $leafCandidate) {
+            throw 'capture leaf-swap fixture was not selected before replacement'
+        }
+        [IO.File]::Delete($leafSwapPath)
+        New-Item -ItemType SymbolicLink -Path $leafSwapPath -Target $symlinkTarget -ErrorAction Stop | Out-Null
+        $leafSwapRejected = $false
+        try {
+            $null = $captureReader.ReadBoundedUtf8($leafCandidate.FullName, 1048576)
+        } catch {
+            $leafSwapRejected = $true
+        }
+        if (-not $leafSwapRejected) {
+            throw 'capture followed a leaf replaced by a reparse point after enumeration'
+        }
+
+        $ancestorSwapRoot = Join-Path $captureFixture 'ancestor-swap'
+        [IO.Directory]::CreateDirectory($ancestorSwapRoot) | Out-Null
+        $ancestorSwapPath = Join-Path $ancestorSwapRoot 'doctor.log'
+        Set-Content -LiteralPath $ancestorSwapPath -Value 'safe diagnostic fixture' -NoNewline
+        $ancestorCandidate = @(Get-WindowsNativeCaptureFiles $ancestorSwapRoot) |
+            Where-Object {
+                $_.FullName.Equals($ancestorSwapPath, [StringComparison]::OrdinalIgnoreCase)
+            } |
+            Select-Object -First 1
+        if ($null -eq $ancestorCandidate) {
+            throw 'capture ancestor-swap fixture was not selected before replacement'
+        }
+        Set-Content -LiteralPath (Join-Path $outsideCaptureRoot 'doctor.log') `
+            -Value 'outside diagnostic fixture' -NoNewline
+        Remove-SafeDisposableTree -Path $ancestorSwapRoot -Root $captureFixture
+        New-Item -ItemType Junction -Path $ancestorSwapRoot -Target $outsideCaptureRoot -ErrorAction Stop | Out-Null
+        $ancestorSwapRejected = $false
+        try {
+            $null = $captureReader.ReadBoundedUtf8($ancestorCandidate.FullName, 1048576)
+        } catch {
+            $ancestorSwapRejected = $true
+        }
+        if (-not $ancestorSwapRejected) {
+            throw 'capture followed a replaced ancestor outside its retained root'
+        }
     } finally {
         [Environment]::SetEnvironmentVariable('DC_E2E_TEST_SECRET', $originalBoundedSecret)
+        if ($null -ne $captureReader) {
+            $captureReader.Dispose()
+        }
         if (Test-Path -LiteralPath $captureFixture) {
             Remove-SafeDisposableTree -Path $captureFixture -Root $root
+        }
+        if ($outsideCaptureRoot -and (Test-Path -LiteralPath $outsideCaptureRoot)) {
+            Remove-SafeDisposableTree -Path $outsideCaptureRoot -Root $outsideCaptureRoot
         }
     }
 
