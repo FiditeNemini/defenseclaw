@@ -7,6 +7,8 @@
 package gateway
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -348,6 +350,91 @@ func TestAlertFatigueTrustRulesMatchAcrossLineBreaks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAlertFatigueInjectionJudgePromptDoesNotMatchOverrideRule(t *testing.T) {
+	for _, profile := range alertFatigueProfiles {
+		t.Run(profile, func(t *testing.T) {
+			root := filepath.Join("..", "..", "policies", "guardrail", profile)
+			pack, err := guardrail.LoadRulePack(root)
+			if err != nil {
+				t.Fatalf("load %s rule pack: %v", profile, err)
+			}
+			judge := pack.InjectionJudge()
+			if judge == nil || strings.TrimSpace(judge.SystemPrompt) == "" {
+				t.Fatalf("%s injection judge prompt is missing", profile)
+			}
+			rule := alertFatigueRule(t, profile, "TRUST-OVERRIDE-INSTRUCT")
+			for _, view := range []string{judge.SystemPrompt, normalizeShell(judge.SystemPrompt)} {
+				if firstAcceptedRuleMatch(rule, view) != nil {
+					t.Fatal("injection judge prompt matched its own override detector")
+				}
+			}
+		})
+	}
+
+	t.Run("embedded fallback", func(t *testing.T) {
+		pack, err := guardrail.LoadRulePack("")
+		if err != nil {
+			t.Fatalf("load embedded rule pack: %v", err)
+		}
+		judge := pack.InjectionJudge()
+		if judge == nil || strings.TrimSpace(judge.SystemPrompt) == "" {
+			t.Fatal("embedded injection judge prompt is missing")
+		}
+		rule := alertFatigueRule(t, "default", "TRUST-OVERRIDE-INSTRUCT")
+		for _, view := range []string{judge.SystemPrompt, normalizeShell(judge.SystemPrompt)} {
+			if firstAcceptedRuleMatch(rule, view) != nil {
+				t.Fatal("embedded injection judge prompt matched its own override detector")
+			}
+		}
+	})
+
+	t.Run("generated policy presets", func(t *testing.T) {
+		content, err := os.ReadFile(filepath.Join("..", "..", "docs-site", "data", "policy-presets.json"))
+		if err != nil {
+			t.Fatalf("read generated policy presets: %v", err)
+		}
+		var generated struct {
+			Presets []struct {
+				Name   string `json:"name"`
+				Bundle struct {
+					Guardrail struct {
+						Judge struct {
+							Injection struct {
+								SystemPrompt string `json:"system_prompt"`
+							} `json:"injection"`
+						} `json:"judge"`
+					} `json:"guardrail"`
+				} `json:"bundle"`
+			} `json:"presets"`
+		}
+		if err := json.Unmarshal(content, &generated); err != nil {
+			t.Fatalf("decode generated policy presets: %v", err)
+		}
+		prompts := make(map[string]string, len(generated.Presets))
+		for _, preset := range generated.Presets {
+			if _, duplicate := prompts[preset.Name]; duplicate {
+				t.Fatalf("generated policy presets duplicate profile %q", preset.Name)
+			}
+			prompts[preset.Name] = preset.Bundle.Guardrail.Judge.Injection.SystemPrompt
+		}
+		if len(prompts) != len(alertFatigueProfiles) {
+			t.Fatalf("generated policy preset count = %d, want %d", len(prompts), len(alertFatigueProfiles))
+		}
+		for _, profile := range alertFatigueProfiles {
+			prompt := prompts[profile]
+			if strings.TrimSpace(prompt) == "" {
+				t.Fatalf("generated %s injection judge prompt is missing", profile)
+			}
+			rule := alertFatigueRule(t, profile, "TRUST-OVERRIDE-INSTRUCT")
+			for _, view := range []string{prompt, normalizeShell(prompt)} {
+				if firstAcceptedRuleMatch(rule, view) != nil {
+					t.Fatalf("generated policy presets matched %s override detector", profile)
+				}
+			}
+		}
+	})
 }
 
 func TestAlertFatigueAuthorityDefiniteArticleAcrossProfiles(t *testing.T) {
