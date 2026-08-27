@@ -54,6 +54,7 @@ import (
 	"github.com/defenseclaw/defenseclaw/internal/observability"
 	"github.com/defenseclaw/defenseclaw/internal/policy"
 	"github.com/defenseclaw/defenseclaw/internal/redaction"
+	"github.com/defenseclaw/defenseclaw/internal/routing"
 	"github.com/defenseclaw/defenseclaw/internal/sandbox"
 	"github.com/defenseclaw/defenseclaw/internal/version"
 	"github.com/defenseclaw/defenseclaw/internal/watcher"
@@ -62,6 +63,16 @@ import (
 
 var launchConfigRestartHelper = defaultLaunchConfigRestartHelper
 var validateManagedGuardianAuthorization = managed.ValidateTrustedFilePath
+
+const (
+	modelRouterHealthCheckInterval = 10 * time.Second
+	modelRouterHealthCheckTimeout  = 2 * time.Second
+	modelRouterHealthProbeError    = "semantic router health probe failed"
+)
+
+type modelRouterHealthChecker interface {
+	Healthy(context.Context) bool
+}
 
 // Sidecar is the long-running process that connects to the agent gateway,
 // watches for skill installs, and exposes a local REST API.
@@ -83,6 +94,7 @@ type Sidecar struct {
 	appProtection *applicationProtectionController
 	osNotifier    *notifier.Dispatcher
 	configMgr     *ConfigManager
+	modelRouter   ModelRouter
 
 	// ipcRunner is injected by the CLI layer to avoid a gateway/ipc import
 	// cycle. A nil runner disables the managed UDS server.
@@ -545,6 +557,175 @@ func (s *Sidecar) publishConfig(cfg *config.Config) *config.Config {
 	return snapshot
 }
 
+// buildTranslateInput converts config.RoutingConfig to routing.TranslateInput.
+func buildTranslateInput(cfg *config.Config) routing.TranslateInput {
+	if cfg == nil {
+		return routing.TranslateInput{}
+	}
+
+	rcfg := cfg.Routing
+	input := routing.TranslateInput{
+		Port:      rcfg.Port,
+		Algorithm: rcfg.Algorithm,
+	}
+
+	// Models
+	for _, m := range rcfg.Models {
+		input.Models = append(input.Models, routing.TranslateModel{
+			Name:         m.Name,
+			Provider:     m.Provider,
+			Model:        m.Model,
+			BaseURL:      m.BaseURL,
+			APIKeyEnv:    m.APIKeyEnv,
+			Capabilities: m.Capabilities,
+		})
+	}
+
+	// Signals
+	for _, k := range rcfg.Signals.Keywords {
+		input.Signals.Keywords = append(input.Signals.Keywords, routing.TranslateKeyword{
+			Name:     k.Name,
+			Keywords: k.Keywords,
+			Operator: k.Operator,
+		})
+	}
+
+	// Decisions
+	for _, d := range rcfg.Decisions {
+		dec := routing.TranslateDecision{
+			Name:      d.Name,
+			Priority:  d.Priority,
+			Operator:  d.Operator,
+			ModelRefs: d.ModelRefs,
+			Algorithm: d.Algorithm,
+		}
+		for _, c := range d.Conditions {
+			dec.Conditions = append(dec.Conditions, routing.TranslateCondition{
+				Signal:        c.Type,
+				MinConfidence: 0.0,
+				Value:         c.Name,
+			})
+		}
+		input.Decisions = append(input.Decisions, dec)
+	}
+
+	return input
+}
+
+func buildModelRouterBackends(cfg *config.Config) []ModelRouterBackend {
+	if cfg == nil {
+		return nil
+	}
+	backends := make([]ModelRouterBackend, 0, len(cfg.Routing.Models))
+	for _, model := range cfg.Routing.Models {
+		backends = append(backends, ModelRouterBackend{
+			Name:      model.Name,
+			Provider:  model.Provider,
+			Model:     model.Model,
+			BaseURL:   model.BaseURL,
+			APIKeyEnv: model.APIKeyEnv,
+		})
+	}
+	return backends
+}
+
+func effectiveRoutingHealthDetails(cfg config.RoutingConfig) map[string]interface{} {
+	mode := "managed"
+	if strings.TrimSpace(cfg.Remote.Endpoint) != "" {
+		mode = "remote"
+	}
+
+	version := strings.TrimPrefix(strings.TrimSpace(cfg.Version), "v")
+	if version == "" {
+		version = routing.TestedVersion
+	}
+	details := map[string]interface{}{
+		"enabled":     true,
+		"mode":        mode,
+		"version":     version,
+		"model_count": len(cfg.Models),
+	}
+	if mode == "managed" {
+		port := cfg.Port
+		if port == 0 {
+			port = routing.DefaultAPIPort
+		}
+		details["port"] = port
+	}
+	return details
+}
+
+func (s *Sidecar) publishRoutingHealthTransitionV8(
+	ctx context.Context,
+	transition routingHealthTransitionV8,
+) {
+	if s == nil {
+		return
+	}
+	metricRuntime, _ := s.observabilityV8LifecycleRuntime().(hookLifecycleMetricV8Runtime)
+	recordRoutingHealthTransitionV8(
+		ctx,
+		s.observabilityV8Emitter(),
+		metricRuntime,
+		transition,
+	)
+}
+
+// runModelRouterHealthMonitor keeps the published routing health aligned with
+// the live classifier after startup. The checker must honor its context; the
+// production RemoteRouterClient does so for every HTTP request.
+func (s *Sidecar) runModelRouterHealthMonitor(
+	ctx context.Context,
+	checker modelRouterHealthChecker,
+	details map[string]interface{},
+	interval time.Duration,
+	probeTimeout time.Duration,
+) {
+	if s == nil || s.health == nil || checker == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = modelRouterHealthCheckInterval
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = modelRouterHealthCheckTimeout
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	lastState := StateRunning
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			healthy := checker.Healthy(probeCtx)
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+
+			nextState := StateRunning
+			lastErr := ""
+			if !healthy {
+				nextState = StateError
+				lastErr = modelRouterHealthProbeError
+			}
+			if nextState == lastState {
+				continue
+			}
+			s.health.SetRouting(nextState, lastErr, details)
+			if nextState == StateError {
+				s.publishRoutingHealthTransitionV8(ctx, routingHealthV8ProbeFailed)
+			} else {
+				s.publishRoutingHealthTransitionV8(ctx, routingHealthV8Restored)
+			}
+			lastState = nextState
+		}
+	}
+}
+
 func (s *Sidecar) webhooksSnapshot() *WebhookDispatcher {
 	if s == nil {
 		return nil
@@ -665,6 +846,65 @@ func (s *Sidecar) Run(ctx context.Context) (runErr error) {
 		fmt.Fprintf(os.Stderr, "[sidecar] private-upstream allowlist: %d IPs configured\n", len(allowedIPs))
 	}
 
+	// Initialize semantic router (managed or remote). Sidecar owns this
+	// instance so repeated in-process runs cannot inherit a stale global router.
+	var routingHealthChecker modelRouterHealthChecker
+	var routingHealthDetails map[string]interface{}
+	s.modelRouter = nil
+	s.health.SetRouting(StateDisabled, "", map[string]interface{}{"enabled": false})
+	if s.currentConfig().Routing.Enabled {
+		routingHealthDetails = effectiveRoutingHealthDetails(s.currentConfig().Routing)
+		s.health.SetRouting(StateStarting, "", routingHealthDetails)
+		orchCfg := routing.OrchestratorConfig{
+			Enabled:        true,
+			Version:        s.currentConfig().Routing.Version,
+			Port:           s.currentConfig().Routing.Port,
+			DataDir:        s.currentConfig().DataDir,
+			RemoteEndpoint: s.currentConfig().Routing.Remote.Endpoint,
+			TimeoutMs:      s.currentConfig().Routing.Remote.TimeoutMs,
+			TranslateInput: buildTranslateInput(s.currentConfig()),
+		}
+		result, err := routing.StartManagedRouter(runCtx, orchCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[routing] startup failed: %v (routing disabled)\n", err)
+			s.health.SetRouting(StateError, err.Error(), routingHealthDetails)
+			s.publishRoutingHealthTransitionV8(runCtx, routingHealthV8StartupFailed)
+			emitError(runCtx, "routing", "init-failed", "semantic router disabled", err)
+		} else if result != nil {
+			timeoutMs := orchCfg.TimeoutMs
+			if timeoutMs == 0 {
+				timeoutMs = 50
+			}
+			client := NewConfiguredRemoteRouterClient(
+				result.Endpoint,
+				timeoutMs,
+				buildModelRouterBackends(s.currentConfig()),
+				filepath.Join(s.currentConfig().DataDir, ".env"),
+			)
+			if !client.Healthy(runCtx) {
+				err := errors.New(modelRouterHealthProbeError)
+				fmt.Fprintf(os.Stderr, "[routing] startup failed: %v (routing disabled)\n", err)
+				s.health.SetRouting(StateError, err.Error(), routingHealthDetails)
+				s.publishRoutingHealthTransitionV8(runCtx, routingHealthV8StartupFailed)
+				if result.Lifecycle != nil {
+					_ = result.Lifecycle.Stop()
+				}
+			} else {
+				s.modelRouter = client
+				routingHealthChecker = client
+				s.health.SetRouting(StateRunning, "", routingHealthDetails)
+				fmt.Fprintf(os.Stderr, "[guardrail] semantic model router enabled (endpoint=%s)\n", result.Endpoint)
+				defer func() {
+					if result.Lifecycle != nil {
+						_ = result.Lifecycle.Stop()
+					}
+					s.modelRouter = nil
+					s.health.SetRouting(StateStopped, "", routingHealthDetails)
+				}()
+			}
+		}
+	}
+
 	// Initialize OPA engine before goroutines so both the watcher and the
 	// API reload handler share the same instance.
 	if s.currentConfig().PolicyDir != "" {
@@ -753,6 +993,19 @@ func (s *Sidecar) Run(ctx context.Context) (runErr error) {
 		runCancel()
 		wg.Wait()
 		return fmt.Errorf("sidecar: reconcile observability v8 config: %w", err)
+	}
+	if routingHealthChecker != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.runModelRouterHealthMonitor(
+				runCtx,
+				routingHealthChecker,
+				routingHealthDetails,
+				modelRouterHealthCheckInterval,
+				modelRouterHealthCheckTimeout,
+			)
+		}()
 	}
 
 	// The updater cannot instantiate the target release's logger. It leaves a
@@ -3227,6 +3480,7 @@ func (s *Sidecar) runGuardrail(ctx context.Context) error {
 		proxy.SetWebhookDispatcher(webhooks)
 	}
 	if err == nil && proxy != nil {
+		proxy.SetModelRouter(s.modelRouter)
 		s.setGuardrailProxy(proxy)
 		defer s.setGuardrailProxy(nil)
 		proxy.SetDefaultAgentName(string(s.currentConfig().Claw.Mode))
