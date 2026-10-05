@@ -55,19 +55,13 @@ func copilotHandler(opts Options, event string, timeout int) *object {
 	handler.set("type", "command")
 	if opts.goos() == "windows" {
 		args := []string{"hook", "--connector", "copilot", "--enterprise-managed", "--event", event}
-		quoted := make([]string, 0, len(args))
-		for _, arg := range args {
-			quoted = append(quoted, connector.PowerShellQuoteLiteral(arg))
-		}
-		// Copilot evaluates the powershell field itself; Start-Process -Wait
-		// keeps the GUI-subsystem hook synchronous and returns its exit code.
-		handler.set("powershell", strings.Join([]string{
+		// Copilot evaluates the powershell field itself. The awaited
+		// statements keep the GUI-subsystem hook synchronous and return its
+		// exit code, also when the hook exits at once.
+		handler.set("powershell", strings.Join(append([]string{
 			"$ErrorActionPreference='Stop'",
 			"$env:NoDefaultCurrentDirectoryInExePath='1'",
-			"$hookProcess=Microsoft.PowerShell.Management\\Start-Process -FilePath " + connector.PowerShellQuoteLiteral(opts.HookBinary) +
-				" -ArgumentList @(" + strings.Join(quoted, ",") + ") -NoNewWindow -Wait -PassThru",
-			"exit $hookProcess.ExitCode",
-		}, "; "))
+		}, connector.WindowsAwaitedHookStatements(opts.HookBinary, args)...), "; "))
 	} else {
 		handler.set("bash", shellQuote(opts.HookBinary)+" hook --connector copilot --enterprise-managed --event "+shellQuote(event))
 	}
@@ -237,6 +231,13 @@ func (t copilotTarget) Reconcile(opts Options) (State, error) {
 		}
 		state.Changed = changed
 	}
+	if err := vscodeDevicePolicy(opts, &state, policy.Ownership == config.MachinePolicyOwnershipMerge); err != nil {
+		return state, err
+	}
+	if err := copilotManagedSettings(opts, &state, policy.Ownership == config.MachinePolicyOwnershipMerge); err != nil {
+		return state, err
+	}
+	copilotVSCodeStatus(opts, &state)
 	if err := inspectCopilot(opts, &state); err != nil {
 		return state, err
 	}
@@ -261,6 +262,13 @@ func (t copilotTarget) Verify(opts Options) (State, error) {
 		state.Route = RouteUnsupported
 		return state, nil
 	}
+	if err := vscodeDevicePolicy(opts, &state, false); err != nil {
+		return state, err
+	}
+	if err := copilotManagedSettings(opts, &state, false); err != nil {
+		return state, err
+	}
+	copilotVSCodeStatus(opts, &state)
 	if err := inspectCopilot(opts, &state); err != nil {
 		return state, err
 	}
@@ -275,7 +283,7 @@ func (t copilotTarget) RemoveOwned(opts Options) (State, error) {
 	}
 	state := State{Connector: copilotConnector, Route: RouteMachinePolicy, Paths: paths}
 	err = restoreOrStrip(opts, copilotConnector, paths[0], copilotStrip(opts), true, &state)
-	return state, err
+	return state, errors.Join(err, removeVSCodeDevicePolicy(opts, &state), removeCopilotManagedSettings(opts, &state))
 }
 
 // copilotStrip treats a drop-in carrying a DefenseClaw policy hook as

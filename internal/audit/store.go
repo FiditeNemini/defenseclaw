@@ -222,6 +222,11 @@ type Store struct {
 	ready       atomic.Bool
 	closed      bool
 
+	// checkpointDB is a second connection used only for PASSIVE WAL
+	// checkpoints. It is opened on first use and closed with the store.
+	checkpointMu sync.Mutex
+	checkpointDB *sql.DB
+
 	sqliteBusyMu       sync.RWMutex
 	sqliteBusyObserver SQLiteBusyObservabilityV8
 
@@ -1903,6 +1908,7 @@ func (s *Store) Init() error {
 		return fmt.Errorf("audit: read schema version: %w", err)
 	}
 
+	purgedHistory := false
 	for i := current; i < len(migrations); i++ {
 		m := migrations[i]
 		ver := i + 1
@@ -1910,6 +1916,10 @@ func (s *Store) Init() error {
 		if err := s.applyMigration(ver, m); err != nil {
 			return err
 		}
+		purgedHistory = purgedHistory || (current > 0 && m.description == historicalEvidencePurgeMigrationDescription)
+	}
+	if purgedHistory {
+		s.reclaimPurgedHistory()
 	}
 	if err := ensureJudgeBodyTimestampUnixNano(s.db, legacyJudgeTimestampUnixNanoIndex); err != nil {
 		return fmt.Errorf("audit: verify judge timestamp retention index: %w", err)
@@ -3598,13 +3608,20 @@ func alertEligibilitySQL(legacyActionPlaceholders string) string {
 	)`
 }
 
+// connectorHookAlertSeveritySQL shows an enforced hook block that matched a
+// CRITICAL rule as CRITICAL; the row's own severity stays INFO, so every
+// other enforced block reads as HIGH.
+const connectorHookAlertSeveritySQL = `CASE WHEN json_valid(COALESCE(event.structured_json,''))
+		AND UPPER(COALESCE(json_extract(event.structured_json,'$.severity'),'')) = 'CRITICAL'
+		THEN 'CRITICAL' ELSE 'HIGH' END`
+
 func alertEffectiveSeveritySQL() string {
 	canonicalOutcome := canonicalAlertOutcomeSQL()
 	legacyExplicit := legacyExplicitAlertSQL()
 	return `CASE
 		WHEN UPPER(TRIM(COALESCE(event.severity,''))) NOT IN ('','INFO')
 			THEN UPPER(TRIM(event.severity))
-		WHEN ` + connectorEnforcedAlertSQL() + ` THEN 'HIGH'
+		WHEN ` + connectorEnforcedAlertSQL() + ` THEN ` + connectorHookAlertSeveritySQL + `
 		WHEN event.bucket = 'network.egress'
 		 AND ` + canonicalOutcome + ` IN (` + alertNonAllowOutcomeSQL + `)
 			THEN 'WARNING'
@@ -3654,8 +3671,9 @@ func (s *Store) SelectAlertAcknowledgementTargets(
 		args = append(args, selector.Connector)
 	}
 	if selector.Target != "" {
-		query += ` AND event.target = ?`
-		args = append(args, selector.Target)
+		predicate, values := alertTargetPredicateSQL(selector.Target)
+		query += ` AND ` + predicate
+		args = append(args, values...)
 	}
 	if !selector.Since.IsZero() {
 		query += ` AND julianday(event.timestamp) >= julianday(?)`
@@ -4059,10 +4077,10 @@ func (s *Store) LatestScansByScanner(scannerName string) ([]LatestScanInfo, erro
 		INNER JOIN (
 			SELECT target, MAX(timestamp) as max_ts
 			FROM scan_results
-			WHERE scanner = ?
+			WHERE scanner = ? AND COALESCE(exit_code, 0) = 0 AND COALESCE(error, '') = ''
 			GROUP BY target
 		) latest ON sr.target = latest.target AND sr.timestamp = latest.max_ts
-		WHERE sr.scanner = ?
+		WHERE sr.scanner = ? AND COALESCE(sr.exit_code, 0) = 0 AND COALESCE(sr.error, '') = ''
 	`, scannerName, scannerName)
 	if err != nil {
 		return nil, fmt.Errorf("audit: latest scans by scanner: %w", err)
@@ -4284,6 +4302,26 @@ func (s *Store) CountBlockedEgress() (int, error) {
 	return count, nil
 }
 
+// ListTargetSnapshotPaths returns the paths of every stored baseline
+// snapshot of targetType.
+func (s *Store) ListTargetSnapshotPaths(targetType string) ([]string, error) {
+	rows, err := s.queryDB(context.Background(), "list_target_snapshot_paths",
+		`SELECT target_path FROM target_snapshots WHERE target_type = ?`, targetType)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list target snapshot paths: %w", err)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("audit: list target snapshot paths: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
 // GetTargetSnapshot loads the stored baseline snapshot for a target.
 func (s *Store) GetTargetSnapshot(targetType, targetPath string) (*SnapshotRow, error) {
 	var r SnapshotRow
@@ -4318,6 +4356,12 @@ func (s *Store) Close() error {
 	s.ready.Store(false)
 	s.closed = true
 	err := s.db.Close()
+	s.checkpointMu.Lock()
+	if s.checkpointDB != nil {
+		err = errors.Join(err, s.checkpointDB.Close())
+		s.checkpointDB = nil
+	}
+	s.checkpointMu.Unlock()
 	s.dbPathGuard.close()
 	s.dbPathGuard = nil
 	return err

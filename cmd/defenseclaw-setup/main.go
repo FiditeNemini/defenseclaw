@@ -58,6 +58,10 @@ const (
 	setupValidationTimeout     = 30 * time.Second
 	setupConfigurationTimeout  = 5 * time.Minute
 	setupMigrationTimeout      = 15 * time.Minute
+	// Compiling the CLI startup closure is a one-time, install-time cost that
+	// can take tens of seconds on a loaded host with real-time scanning. It
+	// gets its own bound so the 30-second identity probes measure startup only.
+	setupBytecodeWarmupTimeout = 5 * time.Minute
 	nativeConnectorStateLimit  = int64(64 << 10)
 	nativeConfigRosterLimit    = int64(4 << 20)
 	maxRunCommandUTF16Units    = 260
@@ -346,6 +350,11 @@ func run(opts options) (int, error) {
 			return 1, err
 		}
 		fmt.Println(report)
+		if report != setupVerifySignedReport {
+			// A caller that reads only stderr still learns that this
+			// Setup is unsigned and how to authenticate it.
+			fmt.Fprintln(os.Stderr, report)
+		}
 		return 0, nil
 	}
 	// INS-32: this read-only token/session/desktop gate must remain the first
@@ -402,6 +411,10 @@ func run(opts options) (int, error) {
 func runInstall(opts options, installRoot, dataRoot string) (int, error) {
 	return runInstallContext(context.Background(), opts, installRoot, dataRoot)
 }
+
+// setupProgress receives the name of each install step as it starts; the
+// wizard shows it, so a slow install does not look hung. It must not block.
+var setupProgress = func(string) {}
 
 func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot string) (int, error) {
 	if err := checkSetupContext(ctx); err != nil {
@@ -469,6 +482,7 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 	pathSeparatorReused := oldState != nil && oldState.PathSeparatorReused
 	pathValueCreated := oldState != nil && oldState.PathValueCreated
 
+	setupProgress("Unpacking the installer payload...")
 	payload, err := loadPayload(payloadTempRoot)
 	if err != nil {
 		return 1, err
@@ -536,6 +550,13 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 	opts.OpenCodeConfigDir = transaction.OpenCodeConfigDir
 	opts.OmnigentConfigHome = transaction.OmnigentConfigHome
 	opts.HermesHome = transaction.HermesHome
+	stagingNeed, err := stagingSpaceNeeded(payload)
+	if err != nil {
+		return 1, fmt.Errorf("measure the installer payload: %w", err)
+	}
+	if err := requireFreeSpace(filepath.Dir(transaction.StagingPath), stagingNeed, "stage the install"); err != nil {
+		return 1, err
+	}
 	if err := beginSetupTransaction(transaction); err != nil {
 		return retryRequiredCode, err
 	}
@@ -546,7 +567,9 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 		return tryAbort(err)
 	}
 
+	setupProgress("Extracting the Python runtime, packages and gateway...")
 	if err := stageInstallTree(
+		ctx,
 		payload,
 		transaction.StagingPath,
 		installRoot,
@@ -564,6 +587,7 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 		return tryAbort(err)
 	}
 	if shouldRunPackagedMigrations(transaction.FromVersion, transaction.TargetVersion) {
+		setupProgress("Checking the data migrations...")
 		if err := runPackagedMigrationPreflightWithEnv(
 			transaction.StagingPath,
 			transaction.DataRoot,
@@ -590,6 +614,7 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 		return rollbackQuiescingSetup(transaction, cause)
 	}
 	gatewayPath := filepath.Join(installRoot, "bin", "defenseclaw-gateway.exe")
+	setupProgress("Stopping DefenseClaw for the update...")
 	err = quiesceSetupRuntimeForMutation(
 		transaction,
 		gatewayPath,
@@ -633,6 +658,7 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return tryRestore(err)
 	}
+	setupProgress("Publishing the new install...")
 	if err := renameInstallTree(transaction.StagingPath, installRoot); err != nil {
 		return tryRestore(fmt.Errorf("publish staged install: %w", err))
 	}
@@ -664,6 +690,7 @@ func runInstallContext(ctx context.Context, opts options, installRoot, dataRoot 
 	tryRestorePublished := func(cause error) (int, error) {
 		return rollbackPublishedSetup(transaction, cause)
 	}
+	setupProgress("Migrating data and updating user registration...")
 	if err := activatePublishedSetupTransaction(transaction); err != nil {
 		if errors.Is(err, errPublishedActivationStateChanged) {
 			return retryRequiredCode, fmt.Errorf("activate published setup transaction; target runtime retained for recovery: %w", err)
@@ -1712,7 +1739,7 @@ func publishMaintenanceCopyForTransaction(transaction setupTransaction, unsigned
 	return nil
 }
 
-func stageInstallTree(payload loadedPayload, staging, installRoot, dataRoot, maintenancePath string, transaction setupTransaction, pathEntryOwned, pathSeparatorReused, pathValueCreated bool, opts options) error {
+func stageInstallTree(ctx context.Context, payload loadedPayload, staging, installRoot, dataRoot, maintenancePath string, transaction setupTransaction, pathEntryOwned, pathSeparatorReused, pathValueCreated bool, opts options) error {
 	if err := createExclusiveStagingRoot(staging); err != nil {
 		return err
 	}
@@ -1741,6 +1768,9 @@ func stageInstallTree(payload loadedPayload, staging, installRoot, dataRoot, mai
 	}
 	if err := extractZipFile(filepath.Join(payload.Root, payload.Manifest.SitePackages), sitePackages); err != nil {
 		return fmt.Errorf("extract managed Python packages: %w", err)
+	}
+	if err := warmManagedPythonBytecode(ctx, filepath.Join(staging, "runtime", "python")); err != nil {
+		return err
 	}
 	if err := extractGateway(payload, filepath.Join(staging, "bin")); err != nil {
 		return err
@@ -1912,6 +1942,34 @@ func publishNativeLaunchers(staging string) error {
 
 func validateInstall(root, version string) error {
 	return validateInstallContext(context.Background(), root, version)
+}
+
+// managedBytecodeWarmupScript imports the CLI entry module without running
+// it. The payload ships site-packages without bytecode (the build strips it
+// for reproducibility), so without this step the first defenseclaw.exe launch,
+// which is the bounded --version-json identity probe, compiles and writes every
+// module of the eager CLI import closure. Importing here writes that bytecode
+// into the staged tree under the same interpreter flags the launcher uses.
+const managedBytecodeWarmupScript = `import defenseclaw.main`
+
+func managedBytecodeWarmupArgs() []string {
+	return []string{"-I", "-c", managedBytecodeWarmupScript}
+}
+
+func warmManagedPythonBytecode(ctx context.Context, pythonDir string) error {
+	python := filepath.Join(pythonDir, "python.exe")
+	output, err := runCapturedSetupCommandContext(
+		ctx,
+		setupBytecodeWarmupTimeout,
+		false,
+		sanitizePythonEnv(os.Environ()),
+		python,
+		managedBytecodeWarmupArgs()...,
+	)
+	if err != nil {
+		return setupOperationError(ctx, fmt.Errorf("compile managed CLI bytecode: %w: %s", err, strings.TrimSpace(string(output))))
+	}
+	return nil
 }
 
 func validateInstallContext(ctx context.Context, root, version string) error {
@@ -2441,6 +2499,9 @@ func loadPayload(tempParent string) (loadedPayload, error) {
 	if err := rejectReparseAncestors(tempParent); err != nil {
 		return loadedPayload{}, err
 	}
+	if err := requireFreeSpace(tempParent, zipExpandedSize(reader), "unpack the installer payload"); err != nil {
+		return loadedPayload{}, err
+	}
 	tempRoot, err := os.MkdirTemp(tempParent, ".DefenseClawSetup.")
 	if err != nil {
 		return loadedPayload{}, err
@@ -2473,6 +2534,9 @@ func zipReaderAtFile(file fs.File) (*zip.Reader, error) {
 	return zip.NewReader(readerAt, info.Size())
 }
 
+// setupVerifySignedReport is /verify's report for a signed Setup.
+const setupVerifySignedReport = "DefenseClaw Setup Authenticode verification succeeded"
+
 // verifySetupImage is /verify: it checks the embedded payload against its
 // manifest, then the Setup's Authenticode against the signing state that
 // manifest records. A release built without a code-signing certificate
@@ -2491,7 +2555,7 @@ func verifySetupImage(self string, payload *zip.Reader) (string, error) {
 		return "", setupNotPublished(fmt.Errorf("verify setup Authenticode policy: %w", err))
 	}
 	if !manifest.Unsigned {
-		return "DefenseClaw Setup Authenticode verification succeeded", nil
+		return setupVerifySignedReport, nil
 	}
 	digest, err := fileSHA256(self)
 	if err != nil {
